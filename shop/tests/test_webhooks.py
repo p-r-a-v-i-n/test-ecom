@@ -3,6 +3,7 @@ import hmac
 import json
 import time
 from unittest.mock import patch
+from uuid import uuid4
 
 from django.contrib.auth import get_user_model
 from django.test import override_settings
@@ -71,6 +72,14 @@ class WebhookTests(APITestCase):
         self.order.refresh_from_db()
         self.assertEqual(self.order.status, Order.Status.FAILED)
         with self.captureOnCommitCallbacks(execute=True):
+            self.assertEqual(self.deliver(self.event("evt_failed_again", "checkout.session.async_payment_failed", 201, paid=False)).status_code, 200)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, Order.Status.FAILED)
+        self.assertEqual(self.order.last_payment_event_created, 201)
+        self.assertEqual(StripeEvent.objects.count(), 2)
+        self.assertEqual(Notification.objects.filter(order=self.order, kind=Notification.Kind.FAILED).count(), 1)
+        delay.assert_called_once()
+        with self.captureOnCommitCallbacks(execute=True):
             self.assertEqual(self.deliver(self.event("evt_paid", "checkout.session.async_payment_succeeded", 100)).status_code, 200)
             self.deliver(self.event("evt_old_failure", "checkout.session.async_payment_failed", 50, paid=False))
             self.deliver(self.event("evt_new_failure", "checkout.session.async_payment_failed", 300, paid=False))
@@ -89,11 +98,63 @@ class WebhookTests(APITestCase):
     @patch("shop.tasks.send_order_notification.delay")
     def test_expiry_and_older_failure(self, delay):
         with self.captureOnCommitCallbacks(execute=True):
-            self.deliver(self.event("evt_expired", "checkout.session.expired", 200, paid=False))
-            self.deliver(self.event("evt_older", "checkout.session.async_payment_failed", 100, paid=False))
+            self.assertEqual(self.deliver(self.event("evt_expired", "checkout.session.expired", 200, paid=False)).status_code, 200)
+            self.assertEqual(self.deliver(self.event("evt_expired_again", "checkout.session.expired", 201, paid=False)).status_code, 200)
+            self.assertEqual(self.deliver(self.event("evt_older", "checkout.session.async_payment_failed", 100, paid=False)).status_code, 200)
         self.order.refresh_from_db()
         self.assertEqual(self.order.status, Order.Status.EXPIRED)
+        self.assertEqual(self.order.last_payment_event_created, 201)
+        self.assertEqual(StripeEvent.objects.count(), 3)
+        self.assertEqual(Notification.objects.filter(order=self.order, kind=Notification.Kind.EXPIRED).count(), 1)
         delay.assert_called_once()
+
+    @patch("shop.tasks.send_order_notification.delay")
+    def test_signed_malformed_events_are_rejected_without_side_effects(self, delay):
+        missing_data = self.event("evt_missing_data")
+        del missing_data["data"]
+        null_data = self.event("evt_null_data")
+        null_data["data"] = None
+        missing_session_id = self.event("evt_missing_session_id")
+        del missing_session_id["data"]["object"]["id"]
+        missing_created = self.event("evt_missing_created")
+        del missing_created["created"]
+        invalid_created = self.event("evt_invalid_created", created="not-a-timestamp")
+        original = Order.objects.values().get(pk=self.order.pk)
+        for event in [missing_data, null_data, missing_session_id, missing_created, invalid_created]:
+            with self.subTest(event=event["id"]):
+                with self.captureOnCommitCallbacks(execute=True):
+                    self.assertEqual(self.deliver(event).status_code, 400)
+                self.assertEqual(Order.objects.values().get(pk=self.order.pk), original)
+                self.assertFalse(StripeEvent.objects.exists())
+                self.assertFalse(Notification.objects.exists())
+                delay.assert_not_called()
+
+    @patch("shop.tasks.send_order_notification.delay")
+    def test_webhook_ignored_cases_preserve_orders(self, delay):
+        self.order.payment_intent_id = "pi_order"
+        self.order.save()
+        Order.objects.create(user=self.user, total="24.68", stripe_session_id="cs_other_order")
+        cases = [
+            ("non_checkout_object", {"object": "payment_intent"}),
+            ("non_payment_mode", {"mode": "subscription"}),
+            ("invalid_metadata_uuid", {"id": "cs_unknown", "metadata": {"order_id": "invalid-uuid"}}),
+            ("null_metadata_uuid", {"id": "cs_unknown", "metadata": {"order_id": None}}),
+            ("missing_metadata_uuid", {"id": "cs_unknown", "metadata": {}}),
+            ("nonexistent_order", {"id": "cs_unknown", "metadata": {"order_id": str(uuid4())}}),
+            ("conflicting_payment_intent", {"payment_intent": "pi_other"}),
+            ("mismatched_metadata", {"metadata": {"order_id": str(uuid4())}}),
+        ]
+        original = list(Order.objects.order_by("pk").values())
+        for label, updates in cases:
+            with self.subTest(case=label):
+                event = self.event(f"evt_{label}")
+                event["data"]["object"].update(updates)
+                with self.captureOnCommitCallbacks(execute=True):
+                    self.assertEqual(self.deliver(event).status_code, 200)
+                self.assertEqual(list(Order.objects.order_by("pk").values()), original)
+                self.assertFalse(StripeEvent.objects.exists())
+                self.assertFalse(Notification.objects.exists())
+                delay.assert_not_called()
 
     @patch("shop.tasks.send_order_notification.delay")
     def test_unrelated_and_mismatched_sessions_are_acknowledged_without_transition(self, delay):

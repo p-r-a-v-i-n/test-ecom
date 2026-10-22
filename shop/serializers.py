@@ -9,7 +9,7 @@ User = get_user_model()
 
 class RegistrationSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, trim_whitespace=False, max_length=128)
-    email = serializers.EmailField(required=True, allow_blank=False)
+    email = serializers.EmailField(required=True, allow_blank=False, max_length=User._meta.get_field("email").max_length)
 
     class Meta:
         model = User
